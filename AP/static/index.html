@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>台股多空趨勢預測系統 | 量化多因子擇時終端</title>
+  <link rel="stylesheet" href="/styles.css" />
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
+</head>
+<body>
+  <div class="app-shell">
+    <!-- Top Control Bar -->
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-dot"></div>
+        <div>
+          <h1>台股多空趨勢預測終端</h1>
+          <span class="subtitle">Multi-Factor Quantitative Regime &amp; 20D Forecast</span>
+        </div>
+      </div>
+
+      <div class="controls">
+        <div class="control-group">
+          <label>標的</label>
+          <div class="segmented" id="symbol-switch">
+            <button data-val="^TWII" class="active">^TWII 加權指數</button>
+            <button data-val="0050.TW">0050.TW 台灣50</button>
+          </div>
+        </div>
+
+        <div class="control-group">
+          <label>歷史區間</label>
+          <div class="segmented" id="range-switch">
+            <button data-val="63">近 3 月</button>
+            <button data-val="126" class="active">近半年</button>
+            <button data-val="252">近 1 年</button>
+            <button data-val="450">近 2 年</button>
+          </div>
+        </div>
+
+        <div class="control-group zoom-group">
+          <button id="btn-zoom-in" title="放大線圖">＋ 放大</button>
+          <button id="btn-zoom-out" title="縮小線圖">－ 縮小</button>
+          <button id="btn-zoom-reset" title="重置縮放">↺ 重置</button>
+          <button id="btn-refresh" class="primary-btn" title="強制重新抓取市場資料">⟳ 更新資料</button>
+        </div>
+      </div>
+    </header>
+
+    <!-- Main Content Grid -->
+    <main class="main-grid">
+      <!-- Left Sidebar: Factors & Live Decision -->
+      <aside class="sidebar">
+        <!-- Regime & Capital Allocation Card -->
+        <section class="card decision-card">
+          <div class="card-header">
+            <span>即時多空決策</span>
+            <span id="last-date-badge" class="badge">--</span>
+          </div>
+
+          <div class="price-row">
+            <div class="price-val" id="kpi-close">--</div>
+            <div class="price-chg" id="kpi-chg">--</div>
+          </div>
+
+          <div class="regime-banner" id="regime-banner">
+            <div class="regime-label">主要趨勢狀態</div>
+            <div class="regime-text" id="kpi-regime">--</div>
+          </div>
+
+          <!-- Capital Allocation Bar -->
+          <div class="alloc-box">
+            <div class="alloc-header">
+              <span>建議作多資金比例</span>
+              <strong id="kpi-alloc">--%</strong>
+            </div>
+            <div class="alloc-bar-track">
+              <div class="alloc-bar-fill" id="alloc-bar-fill" style="width: 50%"></div>
+            </div>
+            <div class="alloc-hint" id="alloc-hint">依據紅綠多空柱狀體強度動態配置持股水位</div>
+          </div>
+
+          <!-- 20-Day Forecast Summary -->
+          <div class="forecast-box">
+            <div class="forecast-title">未來 20 個交易日趨勢預測</div>
+            <div class="forecast-grid">
+              <div>
+                <span class="muted">目標區間中值</span>
+                <strong id="kpi-f20-price">--</strong>
+              </div>
+              <div>
+                <span class="muted">預期變動</span>
+                <strong id="kpi-f20-chg">--</strong>
+              </div>
+              <div>
+                <span class="muted">20日後狀態</span>
+                <strong id="kpi-f20-regime">--</strong>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- Quantitative Factor Toggles -->
+        <section class="card factors-card">
+          <div class="card-header">
+            <span>量化因子開關 (即時重算)</span>
+            <button id="btn-all-factors" class="link-btn">全選</button>
+          </div>
+          <p class="card-sub">勾選欲納入主要趨勢線（粗線）計算的因子，各因子以不同顏色細線獨立呈現。</p>
+          <div id="factor-list" class="factor-list"></div>
+        </section>
+
+        <!-- Macro & Chip Snapshot -->
+        <section class="card macro-card">
+          <div class="card-header">
+            <span>市場情緒與籌碼總經讀數</span>
+          </div>
+          <div class="macro-grid">
+            <div class="macro-item">
+              <span class="muted">^VIX 恐慌指數</span>
+              <strong id="m-vix">--</strong>
+            </div>
+            <div class="macro-item">
+              <span class="muted">TWD=X 美元/台幣</span>
+              <strong id="m-twd">--</strong>
+            </div>
+            <div class="macro-item">
+              <span class="muted">三大法人買賣超</span>
+              <strong id="m-inst">--</strong>
+            </div>
+            <div class="macro-item">
+              <span class="muted">外資台指期淨OI</span>
+              <strong id="m-oi">--</strong>
+            </div>
+            <div class="macro-item full">
+              <span class="muted">國發會景氣燈號</span>
+              <strong id="m-ndc">--</strong>
+            </div>
+          </div>
+          <div class="source-note" id="source-note">資料來源: yfinance / FinMind</div>
+        </section>
+      </aside>
+
+      <!-- Right Area: Professional Charts & Backtest -->
+      <section class="workspace">
+        <!-- Legend Bar -->
+        <div class="chart-legend-bar">
+          <div class="legend-item"><span class="line-swatch thick red"></span> 作多趨勢 (&gt; +0.15)</div>
+          <div class="legend-item"><span class="line-swatch thick white"></span> 多空持平 (-0.15 ~ +0.15)</div>
+          <div class="legend-item"><span class="line-swatch thick green"></span> 作空趨勢 (&lt; -0.15)</div>
+          <div class="legend-item"><span class="line-swatch dashed"></span> 未來 20 日預測延伸</div>
+          <div class="legend-tip">提示：可使用滑鼠滾輪縮放、拖曳平移，或移動下方時間軸拉桿</div>
+        </div>
+
+        <!-- Main Synchronized Multi-Grid Chart -->
+        <div class="card chart-card">
+          <div id="main-chart" class="main-chart"></div>
+        </div>
+
+        <!-- Backtest Comparison Card (Bull Long / Bear Short Value) -->
+        <section class="card backtest-card">
+          <div class="backtest-left">
+            <div class="card-header">
+              <span>策略回測對比（牛長熊短市場特性評估）</span>
+              <span id="bt-days-badge" class="badge">近 1 年</span>
+            </div>
+            <p class="bt-desc">
+              台股長期呈現「牛長熊短」，擇時策略在急漲段可能略遜於純買進持有，核心價值在於<strong>大幅壓低最大回撤 (MDD)</strong> 與<strong>提高夏普比率</strong>，保留空頭修正期低檔再投入的資金彈性。
+            </p>
+            <div class="bt-table">
+              <div class="bt-row bt-head">
+                <div>指標</div>
+                <div>多因子擇時</div>
+                <div>買進持有</div>
+                <div>策略優勢</div>
+              </div>
+              <div class="bt-row">
+                <div>總報酬率</div>
+                <div id="bt-st-ret">--</div>
+                <div id="bt-bh-ret">--</div>
+                <div id="bt-exp">平均持股 --%</div>
+              </div>
+              <div class="bt-row">
+                <div>最大回撤 (MDD)</div>
+                <div id="bt-st-mdd">--</div>
+                <div id="bt-bh-mdd">--</div>
+                <div id="bt-mdd-diff" class="highlight-pos">--</div>
+              </div>
+              <div class="bt-row">
+                <div>夏普比率 (Sharpe)</div>
+                <div id="bt-st-sharpe">--</div>
+                <div id="bt-bh-sharpe">--</div>
+                <div id="bt-sharpe-diff" class="highlight-pos">--</div>
+              </div>
+            </div>
+          </div>
+          <div class="backtest-right">
+            <div id="equity-chart" class="equity-chart"></div>
+          </div>
+        </section>
+      </section>
+    </main>
+  </div>
+
+  <div id="loading-overlay" class="loading-overlay hidden">
+    <div class="spinner"></div>
+    <span>正在抓取市場資料與計算量化因子...</span>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

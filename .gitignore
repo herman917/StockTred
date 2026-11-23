@@ -1,0 +1,37 @@
+# Logs & temp
+*.log
+logs/
+temp/
+tmp/
+*.tmp
+*.bak
+*.swp
+
+# Build / dist
+dist/
+build/
+*.egg-info/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# App runtime cache
+AP/cache/
+*.pkl
+
+# Secrets & local env
+.env
+.env.*
+*.pem
+*.key
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
