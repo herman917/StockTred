@@ -22,18 +22,256 @@ function setLoading(flag) {
   else el.classList.add('hidden')
 }
 
+const STATIC_SYMBOL_FILES = {
+  '^TWII': 'data/TWII.json',
+  '0050.TW': 'data/0050TW.json',
+}
+
+const staticCache = {}
+
+function clamp(v, lo, hi) {
+  return Math.max(lo, Math.min(hi, v))
+}
+
+function computeStaticAnalysis(rawPayload, displayDays, activeFactors) {
+  const { meta, factor_meta: factorMeta, rows } = rawPayload
+  const validFactors = activeFactors.filter((f) => factorMeta[f])
+  const totalW = validFactors.reduce((acc, f) => acc + factorMeta[f].weight, 0)
+
+  const BULL_TH = 0.15
+  const BEAR_TH = -0.15
+  const alpha3 = 2 / (3 + 1)
+  const alphaFast = 2 / (10 + 1)
+  const alphaSlow = 2 / (25 + 1)
+
+  let emaComp = 0
+  let emaFast = rows[0].close
+  let emaSlow = rows[0].close
+
+  const enriched = rows.map((r, idx) => {
+    let compRaw = 0
+    if (totalW > 0) {
+      compRaw = validFactors.reduce((acc, f) => acc + (r.factors[f] || 0) * factorMeta[f].weight, 0) / totalW
+      compRaw = clamp(compRaw, -1, 1)
+    }
+    emaComp = idx === 0 ? compRaw : alpha3 * compRaw + (1 - alpha3) * emaComp
+    const composite = clamp(emaComp, -1, 1)
+
+    emaFast = idx === 0 ? r.close : alphaFast * r.close + (1 - alphaFast) * emaFast
+    emaSlow = idx === 0 ? r.close : alphaSlow * r.close + (1 - alphaSlow) * emaSlow
+    const blend = 0.5 + 0.4 * composite
+    const trendOverlay = blend * emaFast + (1 - blend) * emaSlow
+
+    const regime = composite > BULL_TH ? 'bull' : composite < BEAR_TH ? 'bear' : 'neutral'
+    const allocPct = Math.round(clamp((composite + 0.65) / 1.4, 0, 1) * 1000) / 10
+
+    return {
+      ...r,
+      is_forecast: false,
+      trend_overlay: Number(trendOverlay.toFixed(2)),
+      composite: Number(composite.toFixed(4)),
+      regime,
+      alloc_pct: allocPct,
+    }
+  })
+
+  // 20-day forward forecast
+  const last = enriched[enriched.length - 1]
+  const prev5 = enriched[Math.max(0, enriched.length - 5)]
+  const recentSlope = (last.composite - prev5.composite) / 5
+  const rets = []
+  for (let i = 1; i < enriched.length; i++) {
+    rets.push((enriched[i].close - enriched[i - 1].close) / enriched[i - 1].close)
+  }
+  const tail60 = rets.slice(-60)
+  const mean60 = tail60.reduce((a, b) => a + b, 0) / Math.max(tail60.length, 1)
+  const var60 = tail60.reduce((a, b) => a + (b - mean60) ** 2, 0) / Math.max(tail60.length - 1, 1)
+  const histVol = Math.sqrt(var60) || 0.012
+  const dailyVol = Math.max(histVol, (last.vix / 100 / Math.sqrt(252)) * 0.85, 0.006)
+
+  const lastFactors = { ...last.factors }
+  const prev4 = enriched[Math.max(0, enriched.length - 4)]
+  const factorSlopes = {}
+  Object.keys(factorMeta).forEach((f) => {
+    factorSlopes[f] = ((last.factors[f] || 0) - (prev4.factors[f] || 0)) / 4
+  })
+
+  const forecast = []
+  let priceMid = last.close
+  let scoreCur = last.composite
+  let trendCur = last.trend_overlay
+  let curDate = new Date(`${last.date}T00:00:00`)
+
+  for (let step = 1; step <= 20; step++) {
+    curDate.setDate(curDate.getDate() + 1)
+    while (curDate.getDay() === 0 || curDate.getDay() === 6) {
+      curDate.setDate(curDate.getDate() + 1)
+    }
+    const dateStr = curDate.toISOString().slice(0, 10)
+    const decay = Math.exp(-step / 12)
+    const stepFactors = {}
+    Object.keys(factorMeta).forEach((f) => {
+      const longMean = f === 'trend_60ma' || f === 'vix_sentiment' ? 0.12 : 0.05
+      const proj =
+        (lastFactors[f] || 0) * Math.pow(0.93, step) +
+        longMean * (1 - Math.pow(0.93, step)) +
+        factorSlopes[f] * step * decay * 0.45
+      stepFactors[f] = Number(clamp(proj, -1, 1).toFixed(4))
+    })
+
+    if (totalW > 0) {
+      const targetScore = validFactors.reduce((acc, f) => acc + stepFactors[f] * factorMeta[f].weight, 0) / totalW
+      scoreCur = clamp(0.75 * targetScore + 0.25 * (scoreCur + recentSlope * decay), -1, 1)
+    } else {
+      scoreCur = 0
+    }
+
+    const expectedMu = scoreCur * 0.0008
+    priceMid = priceMid * (1 + expectedMu)
+    const bandW = last.close * dailyVol * Math.sqrt(step) * 1.28
+    trendCur = 0.25 * priceMid + 0.75 * trendCur
+
+    const fRegime = scoreCur > BULL_TH ? 'bull' : scoreCur < BEAR_TH ? 'bear' : 'neutral'
+    const fAlloc = Math.round(clamp((scoreCur + 0.65) / 1.4, 0, 1) * 1000) / 10
+
+    forecast.push({
+      date: dateStr,
+      is_forecast: true,
+      price_mid: Number(priceMid.toFixed(2)),
+      price_upper: Number((priceMid + bandW).toFixed(2)),
+      price_lower: Number(Math.max(priceMid - bandW, 1).toFixed(2)),
+      trend_overlay: Number(trendCur.toFixed(2)),
+      composite: Number(scoreCur.toFixed(4)),
+      regime: fRegime,
+      alloc_pct: fAlloc,
+      factors: stepFactors,
+    })
+  }
+
+  // Backtest (last 252 days)
+  const btRows = enriched.slice(-Math.min(252, enriched.length))
+  let bhEq = 1
+  let stEq = 1
+  let bhMax = 1
+  let stMax = 1
+  let bhMdd = 0
+  let stMdd = 0
+  const bhRets = []
+  const stRets = []
+  const equityCurve = []
+  let posSum = 0
+
+  for (let i = 0; i < btRows.length; i++) {
+    const r = i === 0 ? 0 : (btRows[i].close - btRows[i - 1].close) / btRows[i - 1].close
+    const prevPos = i === 0 ? 0.5 : btRows[i - 1].alloc_pct / 100
+    const prev2Pos = i <= 1 ? 0.5 : btRows[i - 2].alloc_pct / 100
+    const turnover = i === 0 ? 0 : Math.abs(prevPos - prev2Pos)
+    const sr = prevPos * r - turnover * 0.001
+
+    posSum += prevPos
+    bhRets.push(r)
+    stRets.push(sr)
+
+    bhEq *= 1 + r
+    stEq *= 1 + sr
+    bhMax = Math.max(bhMax, bhEq)
+    stMax = Math.max(stMax, stEq)
+    bhMdd = Math.min(bhMdd, bhEq / bhMax - 1)
+    stMdd = Math.min(stMdd, stEq / stMax - 1)
+
+    equityCurve.push({
+      date: btRows[i].date,
+      buy_hold: Number(((bhEq - 1) * 100).toFixed(2)),
+      strategy: Number(((stEq - 1) * 100).toFixed(2)),
+    })
+  }
+
+  const calcSharpe = (arr) => {
+    const m = arr.reduce((a, b) => a + b, 0) / Math.max(arr.length, 1)
+    const v = arr.reduce((a, b) => a + (b - m) ** 2, 0) / Math.max(arr.length - 1, 1)
+    const sd = Math.sqrt(v)
+    return sd > 1e-8 ? Number(((m / sd) * Math.sqrt(252)).toFixed(2)) : 0
+  }
+
+  const bhMetrics = {
+    total_return_pct: Number(((bhEq - 1) * 100).toFixed(2)),
+    mdd_pct: Number((bhMdd * 100).toFixed(2)),
+    sharpe: calcSharpe(bhRets),
+  }
+  const stMetrics = {
+    total_return_pct: Number(((stEq - 1) * 100).toFixed(2)),
+    mdd_pct: Number((stMdd * 100).toFixed(2)),
+    sharpe: calcSharpe(stRets),
+  }
+
+  const history = enriched.slice(-Math.max(30, Math.min(displayDays, enriched.length)))
+  const prevRow = history[history.length - 2] || last
+  const priceChg = Number((last.close - prevRow.close).toFixed(2))
+  const priceChgPct = prevRow.close ? Number(((priceChg / prevRow.close) * 100).toFixed(2)) : 0
+  const f20 = forecast[forecast.length - 1]
+  const f20ChgPct = Number((((f20.price_mid - last.close) / last.close) * 100).toFixed(2))
+
+  return {
+    meta: { ...meta, active_factors: activeFactors, display_days: history.length, forecast_days: 20 },
+    factor_meta: factorMeta,
+    summary: {
+      close: last.close,
+      price_chg: priceChg,
+      price_chg_pct: priceChgPct,
+      composite: last.composite,
+      regime: last.regime,
+      alloc_pct: last.alloc_pct,
+      vix: last.vix,
+      twd: last.twd,
+      inst_total: last.inst_total,
+      futures_oi: last.futures_oi,
+      forecast_20d_mid: f20.price_mid,
+      forecast_20d_chg_pct: f20ChgPct,
+      forecast_20d_regime: f20.regime,
+      forecast_20d_score: f20.composite,
+      latest_factors: last.factors,
+    },
+    history,
+    forecast,
+    backtest: {
+      lookback_days: btRows.length,
+      buy_hold: bhMetrics,
+      strategy: stMetrics,
+      mdd_reduction_pct: Number((Math.abs(bhMetrics.mdd_pct) - Math.abs(stMetrics.mdd_pct)).toFixed(2)),
+      sharpe_improvement: Number((stMetrics.sharpe - bhMetrics.sharpe).toFixed(2)),
+      avg_exposure_pct: Number(((posSum / Math.max(btRows.length, 1)) * 100).toFixed(1)),
+      equity_curve: equityCurve,
+    },
+  }
+}
+
 async function fetchAnalysis(forceRefresh = false) {
   setLoading(true)
   try {
     const factorsParam = state.activeFactors.length > 0 ? state.activeFactors.join(',') : 'none'
     const url = `/api/analyze?symbol=${encodeURIComponent(state.symbol)}&days=${state.days}&factors=${encodeURIComponent(factorsParam)}&refresh=${forceRefresh ? '1' : '0'}`
-    const res = await fetch(url)
-    const data = await res.json()
-    if (data.error) {
-      alert(`載入失敗: ${data.error}`)
-      return
+    try {
+      const res = await fetch(url)
+      if (res.ok) {
+        const data = await res.json()
+        if (!data.error) {
+          state.data = data
+          renderAll()
+          return
+        }
+      }
+    } catch (_) {
+      // Fall through to static GitHub Pages mode
     }
-    state.data = data
+
+    // Static GitHub Pages mode
+    const filePath = STATIC_SYMBOL_FILES[state.symbol] || 'data/TWII.json'
+    if (forceRefresh || !staticCache[state.symbol]) {
+      const staticRes = await fetch(`${filePath}?t=${Date.now()}`)
+      if (!staticRes.ok) throw new Error(`無法載入靜態資料 (${staticRes.status})`)
+      staticCache[state.symbol] = await staticRes.json()
+    }
+    state.data = computeStaticAnalysis(staticCache[state.symbol], state.days, state.activeFactors)
     renderAll()
   } catch (err) {
     alert(`連線錯誤: ${err.message}`)
