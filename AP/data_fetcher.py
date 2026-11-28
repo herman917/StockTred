@@ -28,8 +28,133 @@ def _is_cache_fresh(path: Path, ttl: int = CACHE_TTL_SECONDS) -> bool:
   return (time.time() - path.stat().st_mtime) < ttl
 
 
+def _parse_roc_date(date_str: str) -> pd.Timestamp | None:
+  """Parse ROC date string like '115/11/27' or '1151127' into pd.Timestamp."""
+  s = str(date_str).strip()
+  try:
+    if '/' in s:
+      parts = s.split('/')
+      year = int(parts[0]) + 1911
+      return pd.Timestamp(f'{year}-{int(parts[1]):02d}-{int(parts[2]):02d}')
+    if len(s) == 7 and s.isdigit():
+      year = int(s[:3]) + 1911
+      return pd.Timestamp(f'{year}-{s[3:5]}-{s[5:7]}')
+  except Exception:
+    return None
+  return None
+
+
+def _parse_num(val: Any) -> float | None:
+  s = str(val).replace(',', '').strip()
+  if not s or s in ('--', '---', 'X', 'null', 'None'):
+    return None
+  try:
+    return float(s)
+  except ValueError:
+    return None
+
+
+def _fetch_twse_taiex_recent() -> pd.DataFrame:
+  """Fetch current month daily TAIEX OHLCV from TWSE official APIs."""
+  vol_map: dict[pd.Timestamp, float] = {}
+  try:
+    r_vol = requests.get(
+      'https://openapi.twse.com.tw/v1/exchangeReport/FMTQIK',
+      timeout=6,
+    )
+    if r_vol.status_code == 200:
+      for item in r_vol.json():
+        dt = _parse_roc_date(item.get('Date', ''))
+        vol = _parse_num(item.get('TradeVolume'))
+        if dt is not None and vol is not None:
+          vol_map[dt] = vol
+  except Exception:
+    pass
+
+  rows: list[dict[str, Any]] = []
+  try:
+    r = requests.get(
+      'https://www.twse.com.tw/rwd/zh/TAIEX/MI_5MINS_HIST?response=json',
+      timeout=8,
+    )
+    payload = r.json()
+    if payload.get('stat') == 'OK' and payload.get('data'):
+      for rec in payload['data']:
+        dt = _parse_roc_date(rec[0])
+        o, h, l, c = (_parse_num(rec[i]) for i in range(1, 5))
+        if dt is None or None in (o, h, l, c):
+          continue
+        rows.append(
+          {
+            'Date': dt,
+            'Open': o,
+            'High': h,
+            'Low': l,
+            'Close': c,
+            'Volume': vol_map.get(dt, 0.0),
+          }
+        )
+  except Exception:
+    return pd.DataFrame()
+
+  if not rows:
+    return pd.DataFrame()
+  df = pd.DataFrame(rows).set_index('Date').sort_index()
+  return df
+
+
+def _fetch_twse_stock_recent(stock_no: str = '0050') -> pd.DataFrame:
+  """Fetch current month daily stock/ETF OHLCV from TWSE official API."""
+  rows: list[dict[str, Any]] = []
+  try:
+    r = requests.get(
+      f'https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY?stockNo={stock_no}&response=json',
+      timeout=8,
+    )
+    payload = r.json()
+    if payload.get('stat') == 'OK' and payload.get('data'):
+      for rec in payload['data']:
+        dt = _parse_roc_date(rec[0])
+        vol = _parse_num(rec[1])
+        o, h, l, c = (_parse_num(rec[i]) for i in range(3, 7))
+        if dt is None or None in (o, h, l, c):
+          continue
+        rows.append(
+          {
+            'Date': dt,
+            'Open': o,
+            'High': h,
+            'Low': l,
+            'Close': c,
+            'Volume': vol if vol is not None else 0.0,
+          }
+        )
+  except Exception:
+    return pd.DataFrame()
+
+  if not rows:
+    return pd.DataFrame()
+  df = pd.DataFrame(rows).set_index('Date').sort_index()
+  return df
+
+
+def _merge_twse_latest(yf_df: pd.DataFrame, twse_df: pd.DataFrame) -> pd.DataFrame:
+  """Append newer trading days from TWSE when yfinance daily bar is delayed."""
+  if twse_df.empty:
+    return yf_df
+  if yf_df.empty:
+    return twse_df
+  latest_yf = yf_df.index.max()
+  newer = twse_df[twse_df.index > latest_yf]
+  if newer.empty:
+    return yf_df
+  merged = pd.concat([yf_df, newer], axis=0)
+  merged = merged[~merged.index.duplicated(keep='last')].sort_index()
+  return merged
+
+
 def fetch_yfinance_bundle(force_refresh: bool = False) -> dict[str, pd.DataFrame]:
-  """Fetch 2y daily OHLCV for ^TWII, 0050.TW, ^VIX, and TWD=X."""
+  """Fetch 2y daily OHLCV for ^TWII, 0050.TW, ^VIX, and TWD=X, patched with TWSE latest close."""
   _ensure_cache_dir()
   cache_file = CACHE_DIR / 'yf_bundle.pkl'
 
@@ -61,6 +186,10 @@ def fetch_yfinance_bundle(force_refresh: bool = False) -> dict[str, pd.DataFrame
       bundle[sym] = sub
     except Exception:
       bundle[sym] = pd.DataFrame()
+
+  # Patch Taiwan symbols with official TWSE daily close if yfinance lags behind
+  bundle['^TWII'] = _merge_twse_latest(bundle.get('^TWII', pd.DataFrame()), _fetch_twse_taiex_recent())
+  bundle['0050.TW'] = _merge_twse_latest(bundle.get('0050.TW', pd.DataFrame()), _fetch_twse_stock_recent('0050'))
 
   if any(not df.empty for df in bundle.values()):
     try:
